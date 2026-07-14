@@ -1,0 +1,15 @@
+[package]
+name = "lightengine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Standard memory mapping wrapper for safe file loading
+memmap2 = "0.9"
+# Helper for CLI arguments
+clap = { version = "4.4", features = ["derive"] }
+# Multi-threading library for parallelizing loop math
+rayon = "1.8"
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
