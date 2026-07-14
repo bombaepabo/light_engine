@@ -3,6 +3,21 @@ use rayon::prelude::*;
 use std::arch::x86_64::*;
 use crate::model::QuantizedTensor;
 
+unsafe extern "C" {
+    fn gpu_alloc(size: usize) -> *mut std::ffi::c_void;
+    fn gpu_free(device_ptr: *mut std::ffi::c_void);
+    fn gpu_copy_to_device(device_dest: *mut std::ffi::c_void, host_src: *const std::ffi::c_void, size: usize);
+    fn gpu_copy_to_host(host_dest: *mut std::ffi::c_void, device_src: *const std::ffi::c_void, size: usize);
+    fn matmul_q8_gpu_launch(
+        out_device: *mut f32,
+        x_device: *const f32,
+        w_weights_device: *const i8,
+        w_scales_device: *const f32,
+        rows: i32,
+        cols: i32,
+    );
+}
+
 // 1. Root Mean Square Normalization (RMSNorm)
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], epsilon: f32) {
     // Calculate the sum of squares: x_0^2 + x_1^2 + ...
@@ -181,18 +196,41 @@ pub unsafe fn matmul_q8_avx2(out: &mut [f32], x: &[f32], w: &QuantizedTensor, _r
     });
 }
 
-// 3f. Quantized Matrix-Vector Multiplication Wrapper with runtime CPU detection
-pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                matmul_q8_avx2(out, x, w, rows, cols);
-            }
-            return;
-        }
+// 3f. Quantized Matrix-Vector Multiplication on GPU using CUDA
+pub fn matmul_q8_gpu(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize) {
+    let x_size = x.len() * std::mem::size_of::<f32>();
+    let out_size = out.len() * std::mem::size_of::<f32>();
+    
+    unsafe {
+        // Allocate temp GPU buffers for input x and output
+        let x_device = gpu_alloc(x_size) as *mut f32;
+        let out_device = gpu_alloc(out_size) as *mut f32;
+        
+        // Copy x from CPU to GPU
+        gpu_copy_to_device(x_device as *mut _, x.as_ptr() as *const _, x_size);
+        
+        // Launch the GPU kernel
+        matmul_q8_gpu_launch(
+            out_device,
+            x_device,
+            w.weights_device,
+            w.scales_device,
+            rows as i32,
+            cols as i32,
+        );
+        
+        // Copy output back from GPU to CPU
+        gpu_copy_to_host(out.as_mut_ptr() as *mut _, out_device as *const _, out_size);
+        
+        // Free temp GPU buffers
+        gpu_free(x_device as *mut _);
+        gpu_free(out_device as *mut _);
     }
-    matmul_q8_scalar(out, x, w, rows, cols);
+}
+
+// 3g. Quantized Matrix-Vector Multiplication Wrapper
+pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize) {
+    matmul_q8_gpu(out, x, w, rows, cols);
 }
 
 // 4. Rotary Position Embedding (RoPE)

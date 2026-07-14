@@ -1,6 +1,10 @@
 use memmap2::Mmap;
 use crate::model::{Config, TransformerWeights, LayerWeights, QuantizedTensor};
 
+unsafe extern "C" {
+    fn gpu_upload(host_ptr: *const std::ffi::c_void, size: usize) -> *mut std::ffi::c_void;
+}
+
 pub fn read_config(mmap: &Mmap) -> Config {
     let header_bytes = &mmap[0..28];
     let mut header_ints = [0i32; 7];
@@ -44,7 +48,15 @@ fn slice_q8<'a>(data: &'a [f32], offset: &mut usize, size: usize) -> QuantizedTe
         std::slice::from_raw_parts(weights_f32.as_ptr() as *const i8, size)
     };
     
-    QuantizedTensor { scales, weights }
+    // Upload both scales and weights to the GPU VRAM
+    let scales_device = unsafe {
+        gpu_upload(scales.as_ptr() as *const _, b * std::mem::size_of::<f32>()) as *const f32
+    };
+    let weights_device = unsafe {
+        gpu_upload(weights.as_ptr() as *const _, size) as *const i8
+    };
+    
+    QuantizedTensor { scales, weights, scales_device, weights_device }
 }
 
 pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeights<'a> {
@@ -113,6 +125,8 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
         let wq = QuantizedTensor {
             scales: &wq_block.scales[l * q_blocks .. (l + 1) * q_blocks],
             weights: &wq_block.weights[l * q_size .. (l + 1) * q_size],
+            scales_device: unsafe { wq_block.scales_device.add(l * q_blocks) },
+            weights_device: unsafe { wq_block.weights_device.add(l * q_size) },
         };
         
         let k_size = dim * (n_kv_heads * head_size);
@@ -120,10 +134,14 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
         let wk = QuantizedTensor {
             scales: &wk_block.scales[l * k_blocks .. (l + 1) * k_blocks],
             weights: &wk_block.weights[l * k_size .. (l + 1) * k_size],
+            scales_device: unsafe { wk_block.scales_device.add(l * k_blocks) },
+            weights_device: unsafe { wk_block.weights_device.add(l * k_size) },
         };
         let wv = QuantizedTensor {
             scales: &wv_block.scales[l * k_blocks .. (l + 1) * k_blocks],
             weights: &wv_block.weights[l * k_size .. (l + 1) * k_size],
+            scales_device: unsafe { wv_block.scales_device.add(l * k_blocks) },
+            weights_device: unsafe { wv_block.weights_device.add(l * k_size) },
         };
         
         let o_size = (n_heads * head_size) * dim;
@@ -131,6 +149,8 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
         let wo = QuantizedTensor {
             scales: &wo_block.scales[l * o_blocks .. (l + 1) * o_blocks],
             weights: &wo_block.weights[l * o_size .. (l + 1) * o_size],
+            scales_device: unsafe { wo_block.scales_device.add(l * o_blocks) },
+            weights_device: unsafe { wo_block.weights_device.add(l * o_size) },
         };
         
         let rms_ffn_weight = &rms_ffn_weight_block[l * dim .. (l + 1) * dim];
@@ -140,14 +160,20 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
         let w1 = QuantizedTensor {
             scales: &w1_block.scales[l * ffn_blocks .. (l + 1) * ffn_blocks],
             weights: &w1_block.weights[l * ffn_size .. (l + 1) * ffn_size],
+            scales_device: unsafe { w1_block.scales_device.add(l * ffn_blocks) },
+            weights_device: unsafe { w1_block.weights_device.add(l * ffn_size) },
         };
         let w2 = QuantizedTensor {
             scales: &w2_block.scales[l * ffn_blocks .. (l + 1) * ffn_blocks],
             weights: &w2_block.weights[l * ffn_size .. (l + 1) * ffn_size],
+            scales_device: unsafe { w2_block.scales_device.add(l * ffn_blocks) },
+            weights_device: unsafe { w2_block.weights_device.add(l * ffn_size) },
         };
         let w3 = QuantizedTensor {
             scales: &w3_block.scales[l * ffn_blocks .. (l + 1) * ffn_blocks],
             weights: &w3_block.weights[l * ffn_size .. (l + 1) * ffn_size],
+            scales_device: unsafe { w3_block.scales_device.add(l * ffn_blocks) },
+            weights_device: unsafe { w3_block.weights_device.add(l * ffn_size) },
         };
 
         layers.push(LayerWeights {

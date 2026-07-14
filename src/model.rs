@@ -37,7 +37,12 @@ impl Config {
 pub struct QuantizedTensor<'a> {
     pub scales: &'a [f32],   // Scale factor for each block of 32
     pub weights: &'a [i8],   // 8-bit quantized weights
+    pub scales_device: *const f32, // GPU VRAM pointer for scales
+    pub weights_device: *const i8, // GPU VRAM pointer for weights
 }
+
+unsafe impl<'a> Send for QuantizedTensor<'a> {}
+unsafe impl<'a> Sync for QuantizedTensor<'a> {}
 
 // 2. Update LayerWeights to use QuantizedTensor for projection layers
 #[derive(Clone)]
