@@ -55,6 +55,12 @@ pub struct LayerWeights<'a> {
     pub wv: QuantizedTensor<'a>,   // Quantized
     pub wo: QuantizedTensor<'a>,   // Quantized
 
+    // --- ADD THESE THREE BIAS FIELDS ---
+    pub q_bias: &'a [f32],         // Query Bias (size: dim)
+    pub k_bias: &'a [f32],         // Key Bias (size: kv_dim)
+    pub v_bias: &'a [f32],         // Value Bias (size: kv_dim)
+    // -----------------------------------
+
     pub w1: QuantizedTensor<'a>,   // Quantized
     pub w2: QuantizedTensor<'a>,   // Quantized
     pub w3: QuantizedTensor<'a>,   // Quantized
@@ -100,11 +106,27 @@ impl<'a> TransformerWeights<'a> {
             math::rmsnorm(&mut state.xb, &state.x, layer_weights.rms_att_weight, 1e-5);
 
             // Call math::matmul_q8 for quantized projections
-            math::matmul_q8(&mut state.q, &state.xb, &layer_weights.wq, dim, dim);
-            math::matmul_q8(&mut state.k[0 .. n_kv_heads * head_size], &state.xb, &layer_weights.wk, n_kv_heads * head_size, dim);
-            math::matmul_q8(&mut state.v[0 .. n_kv_heads * head_size], &state.xb, &layer_weights.wv, n_kv_heads * head_size, dim);
-            math::rope(&mut state.q, pos, self.freq_cis_real, self.freq_cis_imag, n_heads, head_size);
-            math::rope(&mut state.k, pos, self.freq_cis_real, self.freq_cis_imag, n_kv_heads, head_size);
+            math::matmul_q8(&mut state.q, &state.xb, &layer_weights.wq, dim, dim, state.x_gpu, state.out_gpu);
+            math::matmul_q8(&mut state.k[0 .. n_kv_heads * head_size], &state.xb, &layer_weights.wk, n_kv_heads * head_size, dim, state.x_gpu, state.out_gpu);
+            math::matmul_q8(&mut state.v[0 .. n_kv_heads * head_size], &state.xb, &layer_weights.wv, n_kv_heads * head_size, dim, state.x_gpu, state.out_gpu);
+            
+            // Add QKV attention biases (Qwen-only; slices are empty for Llama)
+            let kv_dim = n_kv_heads * head_size;
+            if !layer_weights.q_bias.is_empty() {
+                for i in 0..dim {
+                    state.q[i] += layer_weights.q_bias[i];
+                }
+            }
+            if !layer_weights.k_bias.is_empty() {
+                for i in 0..kv_dim {
+                    state.k[i] += layer_weights.k_bias[i];
+                    state.v[i] += layer_weights.v_bias[i];
+                }
+            }
+
+            let is_qwen = config.vocab_size == 151936;
+            math::rope(&mut state.q, pos, self.freq_cis_real, self.freq_cis_imag, n_heads, head_size, is_qwen);
+            math::rope(&mut state.k, pos, self.freq_cis_real, self.freq_cis_imag, n_kv_heads, head_size, is_qwen);
 
             let kv_dim = n_kv_heads * head_size;
             let layer_offset = l * seq_len * kv_dim;
@@ -146,7 +168,7 @@ impl<'a> TransformerWeights<'a> {
             }
 
             // Call math::matmul_q8 for quantized attention output projection
-            math::matmul_q8(&mut state.xb, &state.xb2, &layer_weights.wo, dim, dim);
+            math::matmul_q8(&mut state.xb, &state.xb2, &layer_weights.wo, dim, dim, state.x_gpu, state.out_gpu);
 
             for i in 0..dim {
                 state.x[i] += state.xb[i];
@@ -156,12 +178,12 @@ impl<'a> TransformerWeights<'a> {
             math::rmsnorm(&mut state.xb, &state.x, layer_weights.rms_ffn_weight, 1e-5);
 
             // Call math::matmul_q8 for quantized FFN projection layers
-            math::matmul_q8(&mut state.hb, &state.xb, &layer_weights.w1, hidden_dim, dim);
-            math::matmul_q8(&mut state.hb2, &state.xb, &layer_weights.w3, hidden_dim, dim);
+            math::matmul_q8(&mut state.hb,  &state.xb, &layer_weights.w1, hidden_dim, dim,        state.x_gpu, state.out_gpu);
+            math::matmul_q8(&mut state.hb2, &state.xb, &layer_weights.w3, hidden_dim, dim,        state.x_gpu, state.out_gpu);
 
             math::silu_and_mul(&mut state.hb, &state.hb2);
 
-            math::matmul_q8(&mut state.xb, &state.hb, &layer_weights.w2, dim, hidden_dim);
+            math::matmul_q8(&mut state.xb, &state.hb, &layer_weights.w2, dim, hidden_dim, state.x_gpu, state.out_gpu);
 
             for i in 0..dim {
                 state.x[i] += state.xb[i];

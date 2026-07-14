@@ -89,6 +89,12 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
     let wv_block = slice_q8(weights_f32, &mut offset, n_layers * dim * (n_kv_heads * head_size));
     let wo_block = slice_q8(weights_f32, &mut offset, n_layers * (n_heads * head_size) * dim);
     
+    let kv_dim = n_kv_heads * (dim / n_heads);
+    let is_qwen = vocab_size == 151936;
+    let q_bias_block = if is_qwen { slice_next(weights_f32, &mut offset, n_layers * dim)    } else { &[] };
+    let k_bias_block = if is_qwen { slice_next(weights_f32, &mut offset, n_layers * kv_dim) } else { &[] };
+    let v_bias_block = if is_qwen { slice_next(weights_f32, &mut offset, n_layers * kv_dim) } else { &[] };
+
     let rms_ffn_weight_block = slice_next(weights_f32, &mut offset, n_layers * dim);
     
     let w1_block = slice_q8(weights_f32, &mut offset, n_layers * hidden_dim * dim);
@@ -176,6 +182,10 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
             weights_device: unsafe { w3_block.weights_device.add(l * ffn_size) },
         };
 
+        let q_bias = if q_bias_block.is_empty() { &[][..] } else { &q_bias_block[l * dim      .. (l + 1) * dim]      };
+        let k_bias = if k_bias_block.is_empty() { &[][..] } else { &k_bias_block[l * kv_dim   .. (l + 1) * kv_dim]   };
+        let v_bias = if v_bias_block.is_empty() { &[][..] } else { &v_bias_block[l * kv_dim   .. (l + 1) * kv_dim]   };
+
         layers.push(LayerWeights {
             rms_att_weight,
             rms_ffn_weight,
@@ -183,6 +193,9 @@ pub fn load_weights<'a>(raw_data: &'a [u8], config: &Config) -> TransformerWeigh
             wk,
             wv,
             wo,
+            q_bias,
+            k_bias,
+            v_bias,
             w1,
             w2,
             w3,

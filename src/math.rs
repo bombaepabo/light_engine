@@ -4,8 +4,6 @@ use std::arch::x86_64::*;
 use crate::model::QuantizedTensor;
 
 unsafe extern "C" {
-    fn gpu_alloc(size: usize) -> *mut std::ffi::c_void;
-    fn gpu_free(device_ptr: *mut std::ffi::c_void);
     fn gpu_copy_to_device(device_dest: *mut std::ffi::c_void, host_src: *const std::ffi::c_void, size: usize);
     fn gpu_copy_to_host(host_dest: *mut std::ffi::c_void, device_src: *const std::ffi::c_void, size: usize);
     fn matmul_q8_gpu_launch(
@@ -197,40 +195,33 @@ pub unsafe fn matmul_q8_avx2(out: &mut [f32], x: &[f32], w: &QuantizedTensor, _r
 }
 
 // 3f. Quantized Matrix-Vector Multiplication on GPU using CUDA
-pub fn matmul_q8_gpu(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize) {
-    let x_size = x.len() * std::mem::size_of::<f32>();
+// Accepts pre-allocated GPU activation buffers to avoid per-call cudaMalloc/cudaFree overhead.
+pub fn matmul_q8_gpu(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize, x_gpu: *mut f32, out_gpu: *mut f32) {
+    let x_size   = x.len()   * std::mem::size_of::<f32>();
     let out_size = out.len() * std::mem::size_of::<f32>();
-    
+
     unsafe {
-        // Allocate temp GPU buffers for input x and output
-        let x_device = gpu_alloc(x_size) as *mut f32;
-        let out_device = gpu_alloc(out_size) as *mut f32;
-        
-        // Copy x from CPU to GPU
-        gpu_copy_to_device(x_device as *mut _, x.as_ptr() as *const _, x_size);
-        
-        // Launch the GPU kernel
+        // Copy input x from CPU into the pre-allocated GPU buffer
+        gpu_copy_to_device(x_gpu as *mut _, x.as_ptr() as *const _, x_size);
+
+        // Launch the GPU kernel using pre-allocated input and output buffers
         matmul_q8_gpu_launch(
-            out_device,
-            x_device,
+            out_gpu,
+            x_gpu,
             w.weights_device,
             w.scales_device,
             rows as i32,
             cols as i32,
         );
-        
-        // Copy output back from GPU to CPU
-        gpu_copy_to_host(out.as_mut_ptr() as *mut _, out_device as *const _, out_size);
-        
-        // Free temp GPU buffers
-        gpu_free(x_device as *mut _);
-        gpu_free(out_device as *mut _);
+
+        // Copy output back from GPU into the CPU slice
+        gpu_copy_to_host(out.as_mut_ptr() as *mut _, out_gpu as *const _, out_size);
     }
 }
 
 // 3g. Quantized Matrix-Vector Multiplication Wrapper
-pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize) {
-    matmul_q8_gpu(out, x, w, rows, cols);
+pub fn matmul_q8(out: &mut [f32], x: &[f32], w: &QuantizedTensor, rows: usize, cols: usize, x_gpu: *mut f32, out_gpu: *mut f32) {
+    matmul_q8_gpu(out, x, w, rows, cols, x_gpu, out_gpu);
 }
 
 // 4. Rotary Position Embedding (RoPE)
@@ -247,25 +238,42 @@ pub fn rope(
     freq_cis_imag: &[f32],
     n_heads: usize,
     head_size: usize,
+    split_rope: bool,
 ) {
+    let half_size = head_size / 2;
+    
     // Loop through each attention head
     for h in 0..n_heads {
         let head_offset = h * head_size;
         
-        // Loop through elements of this head in pairs (2i, 2i+1)
-        for i in (0..head_size).step_by(2) {
-            let v0 = vec[head_offset + i];
-            let v1 = vec[head_offset + i + 1];
-            
-            // Find the index in our precompiled sine/cosine tables
-            // Offset logic: each position `pos` has `head_size / 2` rotation frequencies.
-            let freq_idx = pos * (head_size / 2) + (i / 2);
-            let f_real = freq_cis_real[freq_idx];
-            let f_imag = freq_cis_imag[freq_idx];
-            
-            // Perform 2D complex multiplication (rotation)
-            vec[head_offset + i] = v0 * f_real - v1 * f_imag;
-            vec[head_offset + i + 1] = v0 * f_imag + v1 * f_real;
+        if split_rope {
+            // Qwen Mode: Split RoPE (Rotates elements across the two halves of the head)
+            for i in 0..half_size {
+                let v0 = vec[head_offset + i];
+                let v1 = vec[head_offset + i + half_size];
+                
+                let freq_idx = pos * half_size + i;
+                let f_real = freq_cis_real[freq_idx];
+                let f_imag = freq_cis_imag[freq_idx];
+                
+                // Perform rotation
+                vec[head_offset + i] = v0 * f_real - v1 * f_imag;
+                vec[head_offset + i + half_size] = v0 * f_imag + v1 * f_real;
+            }
+        } else {
+            // Llama Mode: Interleaved RoPE (Rotates adjacent pairs 2i, 2i+1)
+            for i in (0..head_size).step_by(2) {
+                let v0 = vec[head_offset + i];
+                let v1 = vec[head_offset + i + 1];
+                
+                let freq_idx = pos * half_size + (i / 2);
+                let f_real = freq_cis_real[freq_idx];
+                let f_imag = freq_cis_imag[freq_idx];
+                
+                // Perform rotation
+                vec[head_offset + i] = v0 * f_real - v1 * f_imag;
+                vec[head_offset + i + 1] = v0 * f_imag + v1 * f_real;
+            }
         }
     }
 }
